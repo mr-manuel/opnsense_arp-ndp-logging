@@ -90,6 +90,7 @@ suppress_mac = (
     if config["default"].get("suppress_mac") is not None
     else []
 )
+ignore_case = config["default"].getboolean("ignore_case", fallback=False)
 log_new_entries = config["default"].getboolean("log_new_entries")
 log_mac_changes = config["default"].getboolean("log_mac_changes")
 log_ipv4_changes = config["default"].getboolean("log_ipv4_changes")
@@ -111,6 +112,9 @@ device_mac_addresses = (
 )
 
 suppress_mac.extend(device_mac_addresses)
+
+# suppress_mac is always matched case-insensitively
+suppress_mac = [mac.lower() for mac in suppress_mac]
 
 
 def main():
@@ -152,6 +156,8 @@ def main():
             if len(current_ipv4_entries) > 0:
                 for entry in current_ipv4_entries:
                     ipv4, mac, interface = entry.split()
+                    if ignore_case:
+                        mac = mac.lower()
                     current_entries_dict[mac] = {
                         "ipv4": ipv4,
                         "ipv6": "<unknown>",
@@ -190,6 +196,9 @@ def main():
             if len(current_ipv6_entries) > 0:
                 for entry in current_ipv6_entries:
                     ipv6, mac, interface = entry.split()
+                    if ignore_case:
+                        ipv6 = ipv6.lower()
+                        mac = mac.lower()
                     if mac in current_entries_dict:
                         current_entries_dict[mac]["ipv6"] = ipv6
                     else:
@@ -278,6 +287,9 @@ def main():
                     .stdout.strip()
                     .split("\n")
                 )
+                if ignore_case:
+                    hostname = [name.lower() for name in hostname]
+
                 # Remove duplicates and sort the hostname list
                 hostname = sorted(set(hostname))
                 # Filter out empty strings
@@ -289,8 +301,8 @@ def main():
                     # split by newline, sort and join with ;
                     hostname = "; ".join(sorted(hostname))
 
-                # Skip suppressed MAC addresses
-                if mac in suppress_mac:
+                # Skip suppressed MAC addresses (always matched case-insensitively)
+                if mac.lower() in suppress_mac:
                     continue
 
                 # Check if the MAC entry already exists
@@ -607,6 +619,7 @@ if __name__ == "__main__":
     logging.info(f"protocols: {protocols}")
     logging.info(f"interfaces: {interfaces}")
     logging.info(f"suppress_mac: {suppress_mac}")
+    logging.info(f"ignore_case: {ignore_case}")
 
     mac_vendor_list_download()
 

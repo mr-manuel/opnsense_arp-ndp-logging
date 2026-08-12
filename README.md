@@ -42,6 +42,7 @@ Go to `Services` -> `ARP/NDP Logging` -> `General` and configure the plugin:
 - **Protocols**: Track IPv4 and IPv6, IPv4 only, or IPv6 only.
 - **Interfaces**: Restrict tracking to specific interfaces (default: all).
 - **Suppress MAC addresses**: A list of MAC addresses to exclude from logging.
+- **Ignore case**: Compare MAC, IPv6, and hostname values case-insensitively.
 - **Log new entries / MAC changes / IPv4 changes / IPv6 changes / hostname changes /
   interface changes**: Toggle which kinds of changes get logged.
 - **Retention (days)**: How long log entries are kept (1-365 days, default: 30).

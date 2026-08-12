@@ -26,8 +26,15 @@
         <allownew>true</allownew>
         <help>
             <![CDATA[Add MAC addresses you want to exclude from the notifications in the following format: xx:xx:xx:xx:xx<br>
-            The firewall MAC addresses are already excluded]]>
+            The firewall MAC addresses are already excluded<br>
+            Matching is always case-insensitive; values are stored lowercased]]>
         </help>
+    </field>
+    <field>
+        <id>general.ignore_case</id>
+        <label>Ignore case</label>
+        <type>checkbox</type>
+        <help>Compare MAC, IPv6 and hostname values case-insensitively (values are normalized to lowercase before comparing and storing)</help>
     </field>
     <field>
         <id>general.log_new_entries</id>
