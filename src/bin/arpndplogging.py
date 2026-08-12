@@ -18,7 +18,8 @@ import logging
 import socket
 import configparser
 import sqlite3
-import requests
+import urllib.error
+import urllib.request
 import csv
 from io import StringIO
 from datetime import datetime
@@ -590,13 +591,13 @@ def mac_vendor_list_download():
         or (time.time() - os.path.getmtime(MAC_VENDOR_FILE)) > 365 * 86400
     ):
         url = "https://maclookup.app/downloads/csv-database/get-db"
-        response = requests.get(url)
-        if response.status_code == 200:
-            with open(MAC_VENDOR_FILE, "wb") as f:
-                f.write(response.content)
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:
+                with open(MAC_VENDOR_FILE, "wb") as f:
+                    f.write(response.read())
             logging.info("Downloaded MAC vendor list")
-        else:
-            logging.error("Failed to download MAC vendor list")
+        except urllib.error.URLError as e:
+            logging.error(f"Failed to download MAC vendor list: {e}")
 
 
 _mac_vendor_cache = None

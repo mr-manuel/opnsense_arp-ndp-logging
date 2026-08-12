@@ -1,0 +1,6 @@
+**/__pycache__/
+*.pkg
+*.txz
+*.key
+*.pem
+/work/

@@ -1,0 +1,99 @@
+name: Build and publish pkg repo
+
+# Push a tag like "v1.2.3" to build + publish a release.
+# Use "Run workflow" (workflow_dispatch) to build-and-check without publishing.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      PKG_REPO_PRIVATE_KEY: ${{ secrets.PKG_REPO_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Determine plugin version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Building requires FreeBSD's own make (bmake), pkg(8) and tar/sed/gzip
+      # from base, which only exist on an actual FreeBSD system. GitHub's
+      # hosted runners are Linux/Windows/macOS, so the build -- and the repo
+      # signing, which needs the real pkg(8) -- both happen inside a FreeBSD
+      # VM rather than on the Ubuntu host.
+      - name: Build and sign package in FreeBSD VM
+        id: build
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.2"
+          usesh: true
+          copyback: true
+          envs: "PKG_REPO_PRIVATE_KEY"
+          prepare: |
+            pkg install -y git openssl
+          run: |
+            set -e
+            git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+            cd "${GITHUB_WORKSPACE}"
+            make PLUGIN_VERSION="${{ steps.version.outputs.version }}" package
+            ls -la work/pkg
+
+            if [ -n "${PKG_REPO_PRIVATE_KEY}" ]; then
+              echo "${PKG_REPO_PRIVATE_KEY}" > /tmp/repo.key
+              chmod 600 /tmp/repo.key
+              openssl rsa -in /tmp/repo.key -pubout -out work/pkg/mr-manuel_arp-ndp-logging.pub
+              pkg repo work/pkg /tmp/repo.key
+              rm -f /tmp/repo.key
+              cp repo-conf/mr-manuel_arp-ndp-logging.conf work/pkg/mr-manuel_arp-ndp-logging.conf
+            else
+              echo "PKG_REPO_PRIVATE_KEY not set, skipping repo signing (fine for a workflow_dispatch smoke test)"
+            fi
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-build
+          path: work/pkg
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download package artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: pkg-build
+          path: pkg-repo
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: pkg-repo
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

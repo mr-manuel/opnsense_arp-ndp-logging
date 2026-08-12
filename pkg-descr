@@ -1,0 +1,7 @@
+ARP/NDP Logging tracks and logs changes in the ARP (IPv4) and NDP (IPv6)
+neighbor tables, capturing IPv4/IPv6 addresses, hostnames, MAC addresses
+and interface changes. It is an arpwatch-style alternative for OPNsense,
+configurable to selectively log new devices, MAC changes, IP changes,
+hostname changes and interface changes.
+
+WWW: https://github.com/mr-manuel/opnsense_arp-ndp-logging
