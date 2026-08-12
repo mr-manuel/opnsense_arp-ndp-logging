@@ -20,7 +20,6 @@ import configparser
 import sqlite3
 import requests
 import csv
-import gc
 from io import StringIO
 from datetime import datetime
 
@@ -72,6 +71,12 @@ cursor.execute(
     )
     """
 )
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_entries_mac ON arp_entries (mac)")
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_entries_ipv4 ON arp_entries (ipv4)")
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_entries_ipv6 ON arp_entries (ipv6)")
+cursor.execute(
+    "CREATE INDEX IF NOT EXISTS idx_arp_entries_timestamp ON arp_entries (timestamp)"
+)
 
 
 # Read configuration file
@@ -79,25 +84,29 @@ config = configparser.ConfigParser()
 with open(CONFIG_FILE) as f:
     config.read_file(StringIO("[default]\n" + f.read()))
 
-protocols = config["default"].get("protocols")
-interfaces = (
-    config["default"].get("interfaces").replace("_", ".").split(" ")
-    if config["default"].get("interfaces") is not None
-    else []
-)
-suppress_mac = (
-    config["default"].get("suppress_mac").split(" ")
-    if config["default"].get("suppress_mac") is not None
-    else []
-)
-ignore_case = config["default"].getboolean("ignore_case", fallback=False)
-log_new_entries = config["default"].getboolean("log_new_entries")
-log_mac_changes = config["default"].getboolean("log_mac_changes")
-log_ipv4_changes = config["default"].getboolean("log_ipv4_changes")
-log_ipv6_changes = config["default"].getboolean("log_ipv6_changes")
-log_hostname_changes = config["default"].getboolean("log_hostname_changes")
-log_interface_changes = config["default"].getboolean("log_interface_changes")
-retention_days = config["default"].getint("retention_days")
+try:
+    protocols = config["default"].get("protocols")
+    interfaces = (
+        config["default"].get("interfaces").replace("_", ".").split(" ")
+        if config["default"].get("interfaces") is not None
+        else []
+    )
+    suppress_mac = (
+        config["default"].get("suppress_mac").split(" ")
+        if config["default"].get("suppress_mac") is not None
+        else []
+    )
+    ignore_case = config["default"].getboolean("ignore_case", fallback=False)
+    log_new_entries = config["default"].getboolean("log_new_entries")
+    log_mac_changes = config["default"].getboolean("log_mac_changes")
+    log_ipv4_changes = config["default"].getboolean("log_ipv4_changes")
+    log_ipv6_changes = config["default"].getboolean("log_ipv6_changes")
+    log_hostname_changes = config["default"].getboolean("log_hostname_changes")
+    log_interface_changes = config["default"].getboolean("log_interface_changes")
+    retention_days = config["default"].getint("retention_days")
+except (configparser.Error, ValueError) as e:
+    logging.error(f"Invalid configuration in {CONFIG_FILE}: {e}")
+    raise SystemExit(1)
 
 # add firewall MAC addresses to suppress_mac
 device_mac_addresses = (
@@ -115,6 +124,17 @@ suppress_mac.extend(device_mac_addresses)
 
 # suppress_mac is always matched case-insensitively
 suppress_mac = [mac.lower() for mac in suppress_mac]
+
+
+def resolve_hostname(ip):
+    # Reverse DNS lookup via the system resolver (no subprocess/shell involved)
+    if ip == "<unknown>":
+        return []
+    try:
+        name, aliases, _ = socket.gethostbyaddr(ip)
+        return [n.rstrip(".") for n in [name] + aliases]
+    except OSError:
+        return []
 
 
 def main():
@@ -261,32 +281,20 @@ def main():
                 ipv6 = entry["ipv6"]
                 interface = entry["interface"]
 
-                # Get hostname from IPv4
-                hostname = (
-                    subprocess.run(
-                        "host "
-                        + ipv4
-                        + " | grep -v 'not found' | awk '{print $5}' | sed 's/\\.$//'",
-                        shell=True,
-                        capture_output=True,
-                        text=True,
-                    )
-                    .stdout.strip()
-                    .split("\n")
-                )
-                # Get hostname from IPv6
-                hostname += (
-                    subprocess.run(
-                        "host "
-                        + ipv6
-                        + " | grep -v 'not found' | awk '{print $5}' | sed 's/\\.$//'",
-                        shell=True,
-                        capture_output=True,
-                        text=True,
-                    )
-                    .stdout.strip()
-                    .split("\n")
-                )
+                # A protocol's neighbor cache can expire faster than the other
+                # (e.g. NDP vs ARP), which would otherwise make an already-known
+                # address flap to "<unknown>" every time it isn't seen in a given
+                # poll. Fall back to the last known value for a matched MAC so a
+                # transient cache miss isn't logged/stored as a real change.
+                if mac in saved_entries_dict_by_mac:
+                    saved = saved_entries_dict_by_mac[mac]
+                    if ipv4 == "<unknown>":
+                        ipv4 = saved["ipv4"]
+                    if ipv6 == "<unknown>":
+                        ipv6 = saved["ipv6"]
+
+                # Get hostname from IPv4 and IPv6
+                hostname = resolve_hostname(ipv4) + resolve_hostname(ipv6)
                 if ignore_case:
                     hostname = [name.lower() for name in hostname]
 
@@ -554,14 +562,25 @@ def main():
         time.sleep(60)
 
 
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
+
+
 def rotate_log():
-    # Rotate log file if necessary
-    if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 102400:
-        if os.path.exists(LOG_FILE + ".1"):
-            os.remove(LOG_FILE + ".1")
-        shutil.move(LOG_FILE, LOG_FILE + ".1")
-        open(LOG_FILE, "a").close()
-        logging.info("Rotated log file")
+    # Rotate log file if necessary, keeping up to LOG_BACKUP_COUNT generations
+    if not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) <= LOG_MAX_BYTES:
+        return
+
+    oldest = f"{LOG_FILE}.{LOG_BACKUP_COUNT}"
+    if os.path.exists(oldest):
+        os.remove(oldest)
+    for i in range(LOG_BACKUP_COUNT - 1, 0, -1):
+        src = f"{LOG_FILE}.{i}"
+        if os.path.exists(src):
+            shutil.move(src, f"{LOG_FILE}.{i + 1}")
+    shutil.move(LOG_FILE, f"{LOG_FILE}.1")
+    open(LOG_FILE, "a").close()
+    logging.info("Rotated log file")
 
 
 def mac_vendor_list_download():
@@ -580,8 +599,19 @@ def mac_vendor_list_download():
             logging.error("Failed to download MAC vendor list")
 
 
-def mac_vendor_check(mac):
-    # Load MAC vendor list into a dictionary
+_mac_vendor_cache = None
+_mac_vendor_cache_mtime = None
+
+
+def _get_mac_vendor_cache():
+    # Reload the vendor list only when the file actually changed (e.g. after a
+    # yearly re-download) instead of re-reading/re-parsing it on every lookup
+    global _mac_vendor_cache, _mac_vendor_cache_mtime
+
+    mtime = os.path.getmtime(MAC_VENDOR_FILE)
+    if _mac_vendor_cache is not None and _mac_vendor_cache_mtime == mtime:
+        return _mac_vendor_cache
+
     mac_vendor = {}
     with open(MAC_VENDOR_FILE, "r") as f:
         reader = csv.reader(f)
@@ -591,6 +621,14 @@ def mac_vendor_check(mac):
                 vendor = row[1].strip()
                 mac_vendor[mac_prefix] = vendor
 
+    _mac_vendor_cache = mac_vendor
+    _mac_vendor_cache_mtime = mtime
+    return _mac_vendor_cache
+
+
+def mac_vendor_check(mac):
+    mac_vendor = _get_mac_vendor_cache()
+
     # Search for the vendor by progressively increasing the length of the MAC prefix
     for length in range(6, 9):
         matches = [
@@ -599,14 +637,8 @@ def mac_vendor_check(mac):
             if mac.replace(":", "").lower().startswith(prefix[:length])
         ]
         if len(matches) == 1:
-            # Release memory
-            del mac_vendor
-            gc.collect()
             return matches[0]
 
-    # Release memory
-    del mac_vendor
-    gc.collect()
     return "<unknown>"
 
 
