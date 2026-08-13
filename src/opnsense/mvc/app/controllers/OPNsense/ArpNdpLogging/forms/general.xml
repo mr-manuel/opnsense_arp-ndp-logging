@@ -79,4 +79,67 @@
         <advanced>true</advanced>
         <help>After how many days should an inactive MAC address be deleted from the database? After this period the device is recognized as new</help>
     </field>
+    <field>
+        <id>general.mail.enabled</id>
+        <label>Enable mail notifications</label>
+        <type>checkbox</type>
+        <help>Send a mail for every event type that is enabled for logging above (new entries, MAC/IPv4/IPv6/hostname/interface changes). "Send test mail" saves the settings and reconfigures the service before sending</help>
+    </field>
+    <field>
+        <id>general.mail.smtp_host</id>
+        <label>SMTP host</label>
+        <type>text</type>
+    </field>
+    <field>
+        <id>general.mail.smtp_port</id>
+        <label>SMTP port</label>
+        <type>text</type>
+    </field>
+    <field>
+        <id>general.mail.encryption</id>
+        <label>SMTP encryption</label>
+        <type>dropdown</type>
+    </field>
+    <field>
+        <id>general.mail.smtp_username</id>
+        <label>SMTP username</label>
+        <type>text</type>
+        <help>Leave empty if the SMTP server does not require authentication</help>
+    </field>
+    <field>
+        <id>general.mail.smtp_password</id>
+        <label>SMTP password</label>
+        <type>password</type>
+        <help>Leave empty if the SMTP server does not require authentication</help>
+    </field>
+    <field>
+        <id>general.mail.from_address</id>
+        <label>From address</label>
+        <type>text</type>
+    </field>
+    <field>
+        <id>general.mail.to_addresses</id>
+        <label>To address(es)</label>
+        <type>select_multiple</type>
+        <style>tokenize</style>
+        <allownew>true</allownew>
+        <help>One or more recipient addresses</help>
+    </field>
+    <field>
+        <id>general.webhook.enabled</id>
+        <label>Enable webhook notifications</label>
+        <type>checkbox</type>
+        <help>Send a POST or GET request for every event type that is enabled for logging above. "Send test webhook" saves the settings and reconfigures the service before sending</help>
+    </field>
+    <field>
+        <id>general.webhook.url</id>
+        <label>Webhook URL</label>
+        <type>text</type>
+    </field>
+    <field>
+        <id>general.webhook.method</id>
+        <label>HTTP method</label>
+        <type>dropdown</type>
+        <help>POST sends a JSON body; GET appends the same fields as URL query parameters</help>
+    </field>
 </form>

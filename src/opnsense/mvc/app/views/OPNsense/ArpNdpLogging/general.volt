@@ -10,9 +10,9 @@
     <table class="table-responsive table table-striped">
         <tr>
             <td>
-                <p>⚠️ Enabling this plugin will NOT automatically send mail notifications</p>
-                <p><a id="help_for_general.install" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> To get alerted by mail, you have to set up <a href="/ui/monit" target="_blank">Monit</a> with a Service and Service Test that monitors the <code>/var/log/arpndplogging.log</code> logfile.</p>
-                <p>Click <a id="help_for_general.install" href="#" class="showhelp">here</a> to display the mail alerting setup instructions at the end of this page.</p>
+                <p>⚠️ Enabling this plugin will NOT automatically enable the Mail/Webhook notifications below, and does NOT set up Monit alerting</p>
+                <p>To get alerted, either enable and configure the Mail/Webhook notification settings above (use the "Send test mail"/"Send test webhook" buttons below to verify them), or <a id="help_for_general.install" href="#" class="showhelp"><i class="fa fa-info-circle"></i></a> set up <a href="/ui/monit" target="_blank">Monit</a> with a Service and Service Test that monitors the <code>/var/log/arpndplogging.log</code> logfile instead.</p>
+                <p>Click <a id="help_for_general.install" href="#" class="showhelp">here</a> to display the optional Monit-based mail alerting setup instructions at the end of this page.</p>
                 <p>Do you like this plugin? Consider to <a href="https://github.md0.eu/links/opnsense-arp-ndp-logging" target="_blank">make a donation</a>.</p>
             </td>
         </tr>
@@ -21,10 +21,12 @@
         <hr />
         <button class="btn btn-primary" id="saveAct" type="button"><b>{{ lang._('Save') }}</b> <i id="saveAct_progress"></i></button>
         <button class="btn pull-right" id="resetdbAct" type="button"><b>{{ lang._('Reset database') }}</b> <i id="resetdbAct_progress" class=""></i></button>
+        <button class="btn pull-right" id="testwebhookAct" type="button"><b>{{ lang._('Send test webhook') }}</b> <i id="testwebhookAct_progress" class=""></i></button>
+        <button class="btn pull-right" id="testmailAct" type="button"><b>{{ lang._('Send test mail') }}</b> <i id="testmailAct_progress" class=""></i></button>
     </div>
     <div class="col-md-12 hidden" data-for="help_for_general.install">
         <hr />
-        <h2>How to setup mail alerting</h2>
+        <h2>How to setup mail alerting via Monit (optional)</h2>
         <ol>
             <li>
                 <p>Go to <code>Services</code> -&gt; <code>Monit</code> -&gt; <code>Settings</code> and then to the <code>General Settings</code> tab. Make sure you enabled Monit and populated the mail fields.</p>
@@ -113,12 +115,50 @@ $DESCRIPTION
 
         updateServiceControlUI('arpndplogging');
 
-        $("#saveAct").click(function(){
-            saveFormToEndpoint(url="/api/arpndplogging/general/set", formid='frm_general_settings',callback_ok=function(){
-            $("#saveAct_progress").addClass("fa fa-spinner fa-pulse");
+        // Saves the form and re-renders the service config, then calls back -
+        // shared by Save and by the test buttons, since a test always has to
+        // run against the settings currently in the form, not stale ones from
+        // the last time Save was clicked
+        function saveAndReconfigure(onDone) {
+            saveFormToEndpoint(url="/api/arpndplogging/general/set", formid='frm_general_settings', callback_ok=function(){
                 ajaxCall(url="/api/arpndplogging/service/reconfigure", sendData={}, callback=function(data,status) {
                     updateServiceControlUI('arpndplogging');
-                    $("#saveAct_progress").removeClass("fa fa-spinner fa-pulse");
+                    onDone();
+                });
+            });
+        }
+
+        function showResult(title, message) {
+            if (typeof BootstrapDialog !== "undefined") {
+                BootstrapDialog.show({title: title, message: message});
+            } else {
+                alert(message);
+            }
+        }
+
+        $("#saveAct").click(function(){
+            $("#saveAct_progress").addClass("fa fa-spinner fa-pulse");
+            saveAndReconfigure(function() {
+                $("#saveAct_progress").removeClass("fa fa-spinner fa-pulse");
+            });
+        });
+
+        $("#testmailAct").click(function () {
+            $("#testmailAct_progress").addClass("fa fa-spinner fa-pulse");
+            saveAndReconfigure(function() {
+                ajaxCall(url="/api/arpndplogging/service/testmail", sendData={}, callback=function(data,status) {
+                    $("#testmailAct_progress").removeClass("fa fa-spinner fa-pulse");
+                    showResult('{{ lang._('Test mail') }}', data.response);
+                });
+            });
+        });
+
+        $("#testwebhookAct").click(function () {
+            $("#testwebhookAct_progress").addClass("fa fa-spinner fa-pulse");
+            saveAndReconfigure(function() {
+                ajaxCall(url="/api/arpndplogging/service/testwebhook", sendData={}, callback=function(data,status) {
+                    $("#testwebhookAct_progress").removeClass("fa fa-spinner fa-pulse");
+                    showResult('{{ lang._('Test webhook') }}', data.response);
                 });
             });
         });

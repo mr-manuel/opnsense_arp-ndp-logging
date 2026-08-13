@@ -15,7 +15,7 @@
 PLUGINSDIR=		${.CURDIR}
 
 PLUGIN_NAME=		arp-ndp-logging
-PLUGIN_VERSION?=	0.0.4
+PLUGIN_VERSION?=	0.0.5
 PLUGIN_COMMENT=		ARP/NDP change logging (arpwatch alternative)
 PLUGIN_MAINTAINER=	github.com/mr-manuel
 PLUGIN_WWW=		https://github.com/mr-manuel/opnsense_arp-ndp-logging

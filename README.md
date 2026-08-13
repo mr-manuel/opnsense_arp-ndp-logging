@@ -6,7 +6,10 @@ address changes, hostname changes and interface changes - the same idea as `arpw
 `arp-scan` or a DHCP lease log, but built directly into the OPNsense GUI as a proper
 plugin with no external Monit/syslog setup required. Every logged device also gets its
 manufacturer resolved from its MAC address (OUI/vendor lookup), so log entries and
-change notifications are easier to identify at a glance.
+change notifications are easier to identify at a glance. It can alert on the same
+events by mail and/or webhook, prefers Dnsmasq host overrides and DHCP static
+mappings over reverse DNS when resolving hostnames, and ships a Lobby dashboard
+widget showing the device count and recent activity.
 
 <small>GitHub repository: [mr-manuel/opnsense_arp-ndp-logging](https://github.com/mr-manuel/opnsense_arp-ndp-logging)</small>
 
@@ -66,7 +69,33 @@ Go to `Services` -> `ARP/NDP Logging` -> `General` and configure the plugin:
 - **Log new entries / MAC changes / IPv4 changes / IPv6 changes / hostname changes /
   interface changes**: Toggle which kinds of changes get logged.
 - **Retention (days)**: How long log entries are kept (1-365 days, default: 30).
+- **Enable mail notifications**: Sends a mail for every event type enabled above.
+  Configure the SMTP host/port/encryption, optional username/password, a From
+  address and one or more To addresses. The **Send test mail** button saves the
+  settings and reconfigures the service before sending, so it always reflects
+  what's currently in the form.
+- **Enable webhook notifications**: Sends a POST (JSON body) or GET (query string)
+  request to a webhook URL for every event type enabled above. The payload/query
+  fields are: `event_type`, `mac`, `ipv4`, `ipv6`, `hostname`, `vendor`, `interface`,
+  `timestamp`, `message`. The **Send test webhook** button likewise saves and
+  reconfigures first.
 
 Use `Services` -> `ARP/NDP Logging` -> `Log File` to view the log directly in the GUI.
 The service widget's **Reset Database** button stops the service, wipes its database
 (so every device is logged as new again on the next scan) and restarts it.
+
+## Hostname resolution
+
+When resolving a device's hostname, the plugin checks these sources in order and
+uses the first match:
+
+1. Dnsmasq host overrides (`Services` -> `Dnsmasq DNS/DHCP` -> `Hosts`)
+2. ISC DHCP static mappings on enabled interfaces (hostname field, falling back to
+   the description)
+3. Reverse DNS (PTR lookup) on the device's IPv4/IPv6 address
+
+## Dashboard widget
+
+A `ArpNdpLogging` widget is available on the Lobby dashboard, showing the total
+number of tracked devices and the most recently added/changed devices. It shows an
+error instead of the usual data if the service is not running.

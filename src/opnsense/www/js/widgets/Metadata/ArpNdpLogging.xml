@@ -1,0 +1,22 @@
+<metadata>
+    <arpndplogging>
+        <filename>ArpNdpLogging.js</filename>
+        <link>/ui/arpndplogging/general</link>
+        <endpoints>
+            <endpoint>/api/arpndplogging/service/stats</endpoint>
+        </endpoints>
+        <translations>
+            <title>ARP/NDP Logging</title>
+            <total>Total devices</total>
+            <hostname>Hostname</hostname>
+            <ip>IPv4</ip>
+            <ipv6>IPv6</ipv6>
+            <mac>MAC</mac>
+            <event>Event</event>
+            <time>Time</time>
+            <columns>Columns</columns>
+            <limit>Entries to show</limit>
+            <not_running>ArpNdpLogging daemon is not running</not_running>
+        </translations>
+    </arpndplogging>
+</metadata>
