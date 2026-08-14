@@ -226,6 +226,12 @@ _stop_event = threading.Event()
 _capture_procs = []
 _capture_procs_lock = threading.Lock()
 
+# Module-level so the signal handler can push a wakeup sentinel into it -
+# otherwise the main loop can stay blocked in capture_queue.get() for up to
+# its poll timeout after SIGTERM, making "service stop"/"restart" (and thus
+# the UI Save button, which reconfigures the service) appear to hang.
+_capture_queue = queue.Queue()
+
 # Brand-new devices awaiting their delayed "new entry" mail (mac -> epoch
 # deadline). Only ever touched from the single-threaded main() loop that
 # calls _process_entries()/_flush_pending_new_entries(), so no lock needed.
@@ -1058,10 +1064,13 @@ def _handle_shutdown(_signum, _frame):
             p.terminate()
         except OSError:
             pass
+    # Wake up a main loop blocked in capture_queue.get(timeout=...) right
+    # away instead of leaving it to wait out the rest of its poll timeout.
+    _capture_queue.put(None)
 
 
 def main():
-    capture_queue = queue.Queue()
+    capture_queue = _capture_queue
     bpf_filter = _build_bpf_filter()
     capture_interfaces = interfaces if len(interfaces) > 0 else _enumerate_all_interfaces()
 
@@ -1093,14 +1102,16 @@ def main():
         pending_wait = _next_pending_new_entry_wait()
         poll_timeout = 60 if pending_wait is None else min(60, pending_wait)
         try:
-            mac, proto, ip, iface = capture_queue.get(timeout=poll_timeout)
-            _append_observation(batch, mac, proto, ip, iface)
+            item = capture_queue.get(timeout=poll_timeout)
+            if item is not None:
+                _append_observation(batch, *item)
             while True:
                 try:
-                    mac, proto, ip, iface = capture_queue.get_nowait()
+                    item = capture_queue.get_nowait()
                 except queue.Empty:
                     break
-                _append_observation(batch, mac, proto, ip, iface)
+                if item is not None:
+                    _append_observation(batch, *item)
         except queue.Empty:
             pass
 
