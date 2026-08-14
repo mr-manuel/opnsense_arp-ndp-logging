@@ -13,20 +13,26 @@ License: BSD 2-Clause
 import argparse
 import csv
 import html
+import ipaddress
 import json
 import logging
 import os
+import queue
 import shutil
+import signal
 import smtplib
 import socket
 import sqlite3
+import struct
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import configparser
+from email.charset import QP, Charset
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr
@@ -39,6 +45,8 @@ CONFIG_XML_FILE = "/conf/config.xml"
 DB_FILE = "/var/db/arpndplogging/arpndplogging.db"
 LOG_FILE = "/var/log/arpndplogging.log"
 MAC_VENDOR_FILE = "/var/db/arpndplogging/oui.csv"
+TCPDUMP_BIN = "/usr/sbin/tcpdump"
+TCPDUMP_SNAPLEN = 128
 
 # Create directories
 os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
@@ -70,29 +78,48 @@ logging.setLogRecordFactory(CustomLogRecord)
 # Create database
 conn = sqlite3.connect(DB_FILE)
 cursor = conn.cursor()
+cursor.execute("DROP TABLE IF EXISTS arp_entries")  # superseded by devices/addresses below
+
+# One row per known device (MAC). hostname/interface are device-level
+# attributes, so change-detection for those lives here.
 cursor.execute(
     """
-    CREATE TABLE IF NOT EXISTS arp_entries (
-        mac TEXT,
-        ipv4 TEXT,
-        ipv6 TEXT,
-        interface TEXT,
+    CREATE TABLE IF NOT EXISTS devices (
+        mac TEXT PRIMARY KEY,
         hostname TEXT,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        interface TEXT,
+        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_ipv6_alert TIMESTAMP
     )
     """
 )
-cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_entries_mac ON arp_entries (mac)")
-cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_entries_ipv4 ON arp_entries (ipv4)")
-cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_entries_ipv6 ON arp_entries (ipv6)")
+
+# One row per (mac, ip) pair actually observed - a device can legitimately
+# hold several concurrent addresses (link-local + global IPv6, temporary
+# IPv6 privacy addresses, ...), so this must not collapse to a single
+# ipv4/ipv6 value per MAC the way the old arp_entries table did.
 cursor.execute(
-    "CREATE INDEX IF NOT EXISTS idx_arp_entries_timestamp ON arp_entries (timestamp)"
+    """
+    CREATE TABLE IF NOT EXISTS addresses (
+        mac TEXT NOT NULL,
+        ip TEXT NOT NULL,
+        protocol TEXT NOT NULL,
+        interface TEXT,
+        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (mac, ip)
+    )
+    """
 )
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_addresses_mac ON addresses (mac)")
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_addresses_ip ON addresses (ip)")
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_addresses_last_seen ON addresses (last_seen)")
 
 # Create events table (append-only log of new entries/changes, used by the
-# dashboard widget to show recent activity - arp_entries only holds current
-# state per MAC and its timestamp is bumped on every poll, changed or not,
-# so it can't answer "what changed recently" on its own)
+# dashboard widget to show recent activity - devices/addresses only hold
+# current state and their last_seen is bumped on every sighting, changed or
+# not, so they can't answer "what changed recently" on their own)
 cursor.execute(
     """
     CREATE TABLE IF NOT EXISTS events (
@@ -140,9 +167,13 @@ try:
     )
     ignore_case = config["default"].getboolean("ignore_case", fallback=False)
     log_new_entries = config["default"].getboolean("log_new_entries", fallback=True)
+    new_entry_delay_seconds = config["default"].getint("new_entry_delay_seconds", fallback=15)
     log_mac_changes = config["default"].getboolean("log_mac_changes", fallback=True)
     log_ipv4_changes = config["default"].getboolean("log_ipv4_changes", fallback=False)
     log_ipv6_changes = config["default"].getboolean("log_ipv6_changes", fallback=False)
+    ipv6_change_cooldown_hours = config["default"].getint(
+        "ipv6_change_cooldown_hours", fallback=0
+    )
     log_hostname_changes = config["default"].getboolean(
         "log_hostname_changes", fallback=False
     )
@@ -187,6 +218,18 @@ suppress_mac.extend(device_mac_addresses)
 
 # suppress_mac is always matched case-insensitively
 suppress_mac = [mac.lower() for mac in suppress_mac]
+
+# Shared shutdown/process-tracking state for the passive capture workers
+# started in main() - a plain list/lock is enough here since appends/removes
+# only happen from the (few) capture worker threads and the signal handler.
+_stop_event = threading.Event()
+_capture_procs = []
+_capture_procs_lock = threading.Lock()
+
+# Brand-new devices awaiting their delayed "new entry" mail (mac -> epoch
+# deadline). Only ever touched from the single-threaded main() loop that
+# calls _process_entries()/_flush_pending_new_entries(), so no lock needed.
+_pending_new_entries = {}
 
 
 def resolve_hostname(ip):
@@ -380,8 +423,17 @@ def send_mail(event):
         msg["Subject"] = f"ARP/NDP Logging: {_humanize_event_type(event['event_type'])}"
         msg["From"] = formataddr((socket.gethostname(), mail_from))
         msg["To"] = ", ".join(mail_to)
-        msg.attach(MIMEText(_build_mail_text(event), "plain"))
-        msg.attach(MIMEText(_build_mail_html(event), "html"))
+        # Force quoted-printable rather than relying on the default
+        # us-ascii/7bit encoding, which has no line-length handling at all -
+        # _build_mail_html() returns one unbroken line, and without
+        # quoted-printable's self-describing soft line breaks, a relay or
+        # mail client hard-wrapping that oversized line wherever it happens
+        # to land can corrupt content mid-token (e.g. splitting a CSS hex
+        # color in half, breaking that declaration).
+        qp_charset = Charset("utf-8")
+        qp_charset.body_encoding = QP
+        msg.attach(MIMEText(_build_mail_text(event), "plain", qp_charset))
+        msg.attach(MIMEText(_build_mail_html(event), "html", qp_charset))
 
         if mail_encryption == "ssl":
             server = smtplib.SMTP_SSL(mail_smtp_host, mail_smtp_port, timeout=10)
@@ -461,516 +513,596 @@ def emit_event(
             send_webhook(event)
 
 
-def main():
-    while True:
-        time_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def _append_observation(observations, mac, proto, ip, interface):
+    if ignore_case:
+        mac = mac.lower()
+        if proto == "ipv6":
+            ip = ip.lower()
+    observations.append((mac, proto, ip, interface))
 
-        # create a dictionary with the current entries
-        current_entries_dict = {}
 
-        # Check ARP table
-        if protocols == "all" or protocols == "ipv4_only":
-            # $2 = IPv4, $4 = MAC, $6 = Interface
-            filter = ' | grep -v \'incomplete\' | awk \'{gsub(/[()]/, "", $2); print $2 " " $4 " " $6}\''
-            if len(interfaces) == 0:
+def _startup_snapshot():
+    # One-shot arp/ndp table dump, used only to seed state when the daemon
+    # (re)starts, so devices the kernel already has a resolved neighbor-cache
+    # entry for show up immediately instead of waiting for their next
+    # ARP/NDP announcement. Ongoing detection is done by the passive capture
+    # workers below, which - unlike arp -an/ndp -an - can also see devices
+    # that never get a kernel-resolved entry at all (e.g. a DHCP-less device
+    # that only ever announces a link-local/APIPA address).
+    observations = []
+
+    if protocols == "all" or protocols == "ipv4_only":
+        filter = ' | grep -v \'incomplete\' | awk \'{gsub(/[()]/, "", $2); print $2 " " $4 " " $6}\''
+        if len(interfaces) == 0:
+            result = subprocess.run(
+                "arp -an" + filter,
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
+            current_ipv4_entries = result.stdout.strip().split("\n")
+        else:
+            current_ipv4_entries = []
+            for interface in interfaces:
                 result = subprocess.run(
-                    "arp -an" + filter,
+                    "arp -i " + interface + " -an" + filter,
                     shell=True,
                     capture_output=True,
                     text=True,
                 )
-                current_ipv4_entries = result.stdout.strip().split("\n")
-            else:
-                current_ipv4_entries = []
-                for interface in interfaces:
-                    result = subprocess.run(
-                        "arp -i " + interface + " -an" + filter,
-                        shell=True,
-                        capture_output=True,
-                        text=True,
-                    )
-                    current_ipv4_entries.extend(result.stdout.strip().split("\n"))
+                current_ipv4_entries.extend(result.stdout.strip().split("\n"))
 
-            # Filter out empty strings
-            current_ipv4_entries = [
-                entries for entries in current_ipv4_entries if entries
-            ]
+        for entry in [e for e in current_ipv4_entries if e]:
+            ipv4, mac, interface = entry.split()
+            _append_observation(observations, mac, "ipv4", ipv4, interface)
 
-            # populate the current_entries_dict
-            if len(current_ipv4_entries) > 0:
-                for entry in current_ipv4_entries:
-                    ipv4, mac, interface = entry.split()
-                    if ignore_case:
-                        mac = mac.lower()
-                    current_entries_dict[mac] = {
-                        "ipv4": ipv4,
-                        "ipv6": "unknown",
-                        "interface": interface,
-                    }
-
-        # Check NDP table
-        if protocols == "all" or protocols == "ipv6_only":
-            # $1 = IPv6, $2 = MAC, $3 = Interface
-            filter = ' | grep -v "incomplete" | grep -v "Neighbor" | awk \'{gsub(/%.*/, "", $1); print $1 " " $2 " " $3}\''
-            if len(interfaces) == 0:
+    if protocols == "all" or protocols == "ipv6_only":
+        filter = ' | grep -v "incomplete" | grep -v "Neighbor" | awk \'{gsub(/%.*/, "", $1); print $1 " " $2 " " $3}\''
+        if len(interfaces) == 0:
+            result = subprocess.run(
+                "ndp -an" + filter,
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
+            current_ipv6_entries = result.stdout.strip().split("\n")
+        else:
+            current_ipv6_entries = []
+            for interface in interfaces:
                 result = subprocess.run(
-                    "ndp -an" + filter,
+                    "ndp -an | grep " + interface + filter,
                     shell=True,
                     capture_output=True,
                     text=True,
                 )
-                current_ipv6_entries = result.stdout.strip().split("\n")
-            else:
-                current_ipv6_entries = []
-                for interface in interfaces:
-                    result = subprocess.run(
-                        "ndp -an | grep " + interface + filter,
-                        shell=True,
-                        capture_output=True,
-                        text=True,
-                    )
-                    current_ipv6_entries.extend(result.stdout.strip().split("\n"))
+                current_ipv6_entries.extend(result.stdout.strip().split("\n"))
 
-            # Filter out empty strings
-            current_ipv6_entries = [
-                entries for entries in current_ipv6_entries if entries
-            ]
+        for entry in [e for e in current_ipv6_entries if e]:
+            ipv6, mac, interface = entry.split()
+            _append_observation(observations, mac, "ipv6", ipv6, interface)
 
-            # populate the current_entries_dict
-            if len(current_ipv6_entries) > 0:
-                for entry in current_ipv6_entries:
-                    ipv6, mac, interface = entry.split()
-                    if ignore_case:
-                        ipv6 = ipv6.lower()
-                        mac = mac.lower()
-                    if mac in current_entries_dict:
-                        current_entries_dict[mac]["ipv6"] = ipv6
-                    else:
-                        current_entries_dict[mac] = {
-                            "ipv4": "unknown",
-                            "ipv6": ipv6,
-                            "interface": interface,
-                        }
+    return observations
 
-        # Delete expired ARP entries
+
+def _latest_address(mac, proto):
+    cursor.execute(
+        "SELECT ip FROM addresses WHERE mac = ? AND protocol = ? ORDER BY last_seen DESC LIMIT 1",
+        (mac, proto),
+    )
+    row = cursor.fetchone()
+    return row[0] if row else "unknown"
+
+
+def _device_ip_list(mac, proto):
+    cursor.execute(
+        "SELECT ip FROM addresses WHERE mac = ? AND protocol = ?",
+        (mac, proto),
+    )
+    ips = [row[0] for row in cursor.fetchall()]
+    try:
+        # Numeric/address-value order, not lexicographic ("10.0.0.1" would
+        # otherwise sort before "20.0.0.1" but after "100.0.0.1")
+        return sorted(ips, key=ipaddress.ip_address)
+    except ValueError:
+        return sorted(ips)
+
+
+def _format_ip_list(ips):
+    # All currently-known addresses of one protocol for a device, joined for
+    # display in messages/mail - deliberately separate from hostname
+    # resolution below, which only reverse-DNS-looks-up the latest address
+    # per protocol rather than every historical/rotated one (privacy IPv6
+    # addresses in particular are numerous and essentially never have a PTR
+    # record, so resolving all of them on every sighting would be wasted,
+    # blocking DNS work for no benefit).
+    return "; ".join(ips) if ips else "unknown"
+
+
+def _hostname_inputs(mac, proto, ip):
+    # Representative current address per protocol for this device: the one
+    # just observed for its own protocol, and whatever was last seen for the
+    # other protocol (a device can hold several concurrent addresses per
+    # protocol - this intentionally only looks at the most recent one rather
+    # than resolving every address it has ever used).
+    ipv4 = ip if proto == "ipv4" else _latest_address(mac, "ipv4")
+    ipv6 = ip if proto == "ipv6" else _latest_address(mac, "ipv6")
+    return ipv4, ipv6
+
+
+def _resolve_hostname_for_device(ipv4, ipv6):
+    hostname = resolve_hostname(ipv4) + resolve_hostname(ipv6)
+    if ignore_case:
+        hostname = [name.lower() for name in hostname]
+
+    # Remove duplicates and sort the hostname list
+    hostname = sorted(set(hostname))
+    # Filter out empty strings
+    hostname = [name for name in hostname if name]
+
+    if not hostname:
+        return "unknown"
+    # split by newline, sort and join with ;
+    return "; ".join(sorted(hostname))
+
+
+def _entry_message(prefix, ipv4, ipv6, hostname, mac, vendor, interface, changes_message=None):
+    message = (
+        f"{prefix} "
+        + (f"IPv4: {ipv4} | " if protocols == "all" or protocols == "ipv4_only" else "")
+        + (f"IPv6: {ipv6} | " if protocols == "all" or protocols == "ipv6_only" else "")
+        + f"Hostname: {hostname} | MAC: {mac} | Vendor: {vendor} | Interface: {interface}"
+    )
+    if changes_message:
+        message += " | " + " | ".join(changes_message)
+    return message
+
+
+def _process_entries(observations):
+    time_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Age out addresses/devices/events not seen within retention_days. A
+    # device disappears once every address of it has aged out.
+    cursor.execute(
+        f"DELETE FROM addresses WHERE last_seen < datetime('now', '-{retention_days} day')"
+    )
+    cursor.execute("DELETE FROM devices WHERE mac NOT IN (SELECT DISTINCT mac FROM addresses)")
+    cursor.execute(
+        f"DELETE FROM events WHERE timestamp < datetime('now', '-{retention_days} day')"
+    )
+
+    for mac, proto, ip, interface in observations:
+        # Skip suppressed MAC addresses (always matched case-insensitively)
+        if mac.lower() in suppress_mac:
+            continue
+
         cursor.execute(
-            f"DELETE FROM arp_entries WHERE timestamp < datetime('now', '-{retention_days} day')"
+            "SELECT hostname, interface, last_ipv6_alert FROM devices WHERE mac = ?", (mac,)
         )
-        cursor.execute(
-            f"DELETE FROM events WHERE timestamp < datetime('now', '-{retention_days} day')"
+        device_row = cursor.fetchone()
+        is_new_device = device_row is None
+        device_hostname, device_interface, device_last_ipv6_alert = (
+            device_row if device_row else (None, None, None)
         )
 
-        # Select all current ARP entries
-        cursor.execute(
-            "SELECT mac, ipv4, ipv6, interface, hostname, timestamp FROM arp_entries"
-        )
-        saved_ipv4_entries = set(cursor.fetchall())
+        cursor.execute("SELECT 1 FROM addresses WHERE mac = ? AND ip = ?", (mac, ip))
+        is_new_address = cursor.fetchone() is None
 
-        # Save entries in a dictionary with MAC as the key
-        saved_entries_dict_by_mac = {
-            entry[0]: {
-                "ipv4": entry[1],
-                "ipv6": entry[2],
-                "interface": entry[3],
-                "hostname": entry[4],
-                "timestamp": entry[5],
-            }
-            for entry in saved_ipv4_entries
-        }
+        # An IP conflict/spoofing candidate: this exact address is already
+        # claimed by a *different*, still-active (not yet aged out) MAC.
+        # Checked regardless of whether this MAC is otherwise new or known,
+        # so a device that already exists for other reasons and starts
+        # additionally squatting on someone else's IP is still caught -
+        # as is a brand-new MAC immediately claiming an existing device's IP.
+        conflicting_mac = None
+        if is_new_address:
+            cursor.execute(
+                "SELECT mac FROM addresses WHERE ip = ? AND mac != ? ORDER BY last_seen DESC LIMIT 1",
+                (ip, mac),
+            )
+            row = cursor.fetchone()
+            if row:
+                conflicting_mac = row[0]
 
-        # Save entries in a dictionary with MAC as the key
-        saved_ipv4_entries_dict_by_ip = {
-            entry[1]: {
-                "mac": entry[0],
-                "interface": entry[3],
-                "hostname": entry[4],
-                "timestamp": entry[5],
-            }
-            for entry in saved_ipv4_entries
-        }
+        # Representative current address per protocol for this device -
+        # this device can hold several concurrent addresses per protocol;
+        # for hostname resolution and for what's shown in messages/events we
+        # only look at the most recently seen one per protocol, same as the
+        # old single-value behaviour.
+        ipv4, ipv6 = _hostname_inputs(mac, proto, ip)
 
-        # Save entries in a dictionary with MAC as the key
-        saved_ipv6_entries_dict_by_ip = {
-            entry[2]: {
-                "mac": entry[0],
-                "interface": entry[3],
-                "hostname": entry[4],
-                "timestamp": entry[5],
-            }
-            for entry in saved_ipv4_entries
-        }
+        # Get hostname: Dnsmasq host overrides and ISC DHCP static mappings
+        # are checked before falling back to reverse DNS, since they're
+        # authoritative and don't depend on the device actually registering
+        # a PTR record
+        configured_hostname = lookup_configured_hostname(mac)
+        if configured_hostname:
+            hostname = configured_hostname.lower() if ignore_case else configured_hostname
+        else:
+            hostname = _resolve_hostname_for_device(ipv4, ipv6)
 
-        # check if current_ipv4_entries_dict is empty
-        if len(current_entries_dict) > 0:
-            for mac, entry in current_entries_dict.items():
+        vendor = mac_vendor_check(mac)
 
-                ipv4 = entry["ipv4"]
-                ipv6 = entry["ipv6"]
-                interface = entry["interface"]
+        # Persist observed state unconditionally, independent of what (if
+        # anything) ends up logged below
+        if is_new_device:
+            cursor.execute(
+                "INSERT INTO devices (mac, hostname, interface, first_seen, last_seen) VALUES (?, ?, ?, ?, ?)",
+                (mac, hostname, interface, time_now, time_now),
+            )
+        else:
+            cursor.execute(
+                "UPDATE devices SET hostname = ?, interface = ?, last_seen = ? WHERE mac = ?",
+                (hostname, interface, time_now, mac),
+            )
+        if is_new_address:
+            cursor.execute(
+                "INSERT INTO addresses (mac, ip, protocol, interface, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?)",
+                (mac, ip, proto, interface, time_now, time_now),
+            )
+        else:
+            cursor.execute(
+                "UPDATE addresses SET last_seen = ?, interface = ? WHERE mac = ? AND ip = ?",
+                (time_now, interface, mac, ip),
+            )
 
-                # A protocol's neighbor cache can expire faster than the other
-                # (e.g. NDP vs ARP), which would otherwise make an already-known
-                # address flap to "unknown" every time it isn't seen in a given
-                # poll. Fall back to the last known value for a matched MAC so a
-                # transient cache miss isn't logged/stored as a real change.
-                if mac in saved_entries_dict_by_mac:
-                    saved = saved_entries_dict_by_mac[mac]
-                    if ipv4 == "unknown":
-                        ipv4 = saved["ipv4"]
-                    if ipv6 == "unknown":
-                        ipv6 = saved["ipv6"]
+        # Every currently-known address of this device (not just the one
+        # involved in this observation) for display in messages/mail -
+        # computed after the insert/update above so it includes what was
+        # just observed.
+        display_ipv4 = _format_ip_list(_device_ip_list(mac, "ipv4"))
+        display_ipv6 = _format_ip_list(_device_ip_list(mac, "ipv6"))
 
-                # Get hostname: Dnsmasq host overrides and ISC DHCP static
-                # mappings are checked before falling back to reverse DNS,
-                # since they're authoritative and don't depend on the device
-                # actually registering a PTR record
-                configured_hostname = lookup_configured_hostname(mac)
-                if configured_hostname:
-                    hostname = (
-                        configured_hostname.lower()
-                        if ignore_case
-                        else configured_hostname
-                    )
+        # An IP conflict takes priority over "new device"/"new address"
+        # framing - matches the original code's precedence.
+        if conflicting_mac is not None:
+            if not log_mac_changes:
+                continue
+            old_vendor = mac_vendor_check(conflicting_mac)
+            message = _entry_message(
+                "ARP - Changes detected!", display_ipv4, display_ipv6, hostname, mac, vendor, interface,
+                [f"OLD MAC: {conflicting_mac} | OLD vendor: {old_vendor}"],
+            )
+            emit_event(
+                "mac_change", mac, display_ipv4, display_ipv6, hostname, interface, time_now, message,
+                {"mac": conflicting_mac, "vendor": old_vendor},
+            )
+            continue
+
+        if is_new_device:
+            if log_new_entries:
+                if new_entry_delay_seconds > 0:
+                    # Give the other protocol a chance to resolve (e.g. a
+                    # device that announces over NDP and ARP a few seconds
+                    # apart) before mailing, so it goes out once with both
+                    # addresses instead of "New entry" immediately followed
+                    # by a near-duplicate "Changes detected".
+                    _pending_new_entries[mac] = time.time() + new_entry_delay_seconds
                 else:
-                    hostname = resolve_hostname(ipv4) + resolve_hostname(ipv6)
-                    if ignore_case:
-                        hostname = [name.lower() for name in hostname]
-
-                    # Remove duplicates and sort the hostname list
-                    hostname = sorted(set(hostname))
-                    # Filter out empty strings
-                    hostname = [name for name in hostname if name]
-
-                    if not hostname:
-                        hostname = "unknown"
-                    else:
-                        # split by newline, sort and join with ;
-                        hostname = "; ".join(sorted(hostname))
-
-                # Skip suppressed MAC addresses (always matched case-insensitively)
-                if mac.lower() in suppress_mac:
-                    continue
-
-                # Check if the MAC entry already exists
-                if mac in saved_entries_dict_by_mac:
-
-                    changes = False
-                    changes_message = []
-                    event_tags = []
-                    changed_fields = {}
-
-                    # Check if the IPv4 address has changed
-                    if (
-                        (protocols == "all" or protocols == "ipv4_only")
-                        and log_ipv4_changes
-                        and ipv4 != saved_entries_dict_by_mac[mac]["ipv4"]
-                    ):
-                        changes = True
-                        event_tags.append("ipv4_change")
-                        changed_fields["ipv4"] = saved_entries_dict_by_mac[mac]["ipv4"]
-                        changes_message.append(
-                            f"OLD IPv4: {saved_entries_dict_by_mac[mac]['ipv4']}"
-                        )
-
-                    # Check if the IPv6 address has changed
-                    if (
-                        (protocols == "all" or protocols == "ipv6_only")
-                        and log_ipv6_changes
-                        and ipv6 != saved_entries_dict_by_mac[mac]["ipv6"]
-                    ):
-                        changes = True
-                        event_tags.append("ipv6_change")
-                        changed_fields["ipv6"] = saved_entries_dict_by_mac[mac]["ipv6"]
-                        changes_message.append(
-                            f"OLD IPv6: {saved_entries_dict_by_mac[mac]['ipv6']}"
-                        )
-
-                    # Check if the hostname has changed
-                    if (
-                        log_hostname_changes
-                        and hostname != saved_entries_dict_by_mac[mac]["hostname"]
-                    ):
-                        changes = True
-                        event_tags.append("hostname_change")
-                        changed_fields["hostname"] = saved_entries_dict_by_mac[mac]["hostname"]
-                        changes_message.append(
-                            f"OLD Hostname: {saved_entries_dict_by_mac[mac]['hostname']}"
-                        )
-
-                    # Check if the interface has changed
-                    if (
-                        log_interface_changes
-                        and interface != saved_entries_dict_by_mac[mac]["interface"]
-                    ):
-                        changes = True
-                        event_tags.append("interface_change")
-                        changed_fields["interface"] = saved_entries_dict_by_mac[mac]["interface"]
-                        changes_message.append(
-                            f"OLD Interface: {saved_entries_dict_by_mac[mac]['interface']}"
-                        )
-
-                    # Update the entry
-                    if changes:
-                        cursor.execute(
-                            "UPDATE arp_entries SET ipv4 = ?, ipv6 = ?, interface = ?, hostname = ?, timestamp = ? WHERE mac = ?",
-                            (ipv4, ipv6, interface, hostname, time_now, mac),
-                        )
-                        message = (
-                            "ARP - Changes detected! "
-                            + (
-                                f"IPv4: {ipv4} | "
-                                if protocols == "all" or protocols == "ipv4_only"
-                                else ""
-                            )
-                            + (
-                                f"IPv6: {ipv6} | "
-                                if protocols == "all" or protocols == "ipv6_only"
-                                else ""
-                            )
-                            + f"Hostname: {hostname} | MAC: {mac} | Vendor: {mac_vendor_check(mac)} | Interface: {interface}"
-                            + (
-                                " | " + " | ".join(changes_message)
-                                if len(changes_message) > 0
-                                else ""
-                            )
-                        )
-                        emit_event(
-                            ",".join(event_tags),
-                            mac,
-                            ipv4,
-                            ipv6,
-                            hostname,
-                            interface,
-                            time_now,
-                            message,
-                            changed_fields,
-                        )
-                    # Update the timestamp
-                    else:
-                        cursor.execute(
-                            "UPDATE arp_entries SET timestamp = ? WHERE ipv4 = ?",
-                            (time_now, ipv4),
-                        )
-
-                # Check if the IPv4 entry already exists
-                # This check allows to see, if an address is spoofed or multiple devices have the same IP
-                elif ipv4 != "unknown" and ipv4 in saved_ipv4_entries_dict_by_ip:
-
-                    changes = False
-                    changes_message = []
-                    event_tags = []
-                    changed_fields = {}
-
-                    # Check if the MAC address has changed
-                    if (
-                        log_mac_changes
-                        and mac != saved_ipv4_entries_dict_by_ip[ipv4]["mac"]
-                    ):
-                        changes = True
-                        event_tags.append("mac_change")
-                        old_mac = saved_ipv4_entries_dict_by_ip[ipv4]["mac"]
-                        changed_fields["mac"] = old_mac
-                        changed_fields["vendor"] = mac_vendor_check(old_mac)
-                        changes_message.append(
-                            f"OLD MAC: {old_mac} | OLD vendor: {changed_fields['vendor']}"
-                        )
-
-                    # Check if the hostname has changed
-                    if (
-                        log_hostname_changes
-                        and hostname != saved_ipv4_entries_dict_by_ip[ipv4]["hostname"]
-                    ):
-                        changes = True
-                        event_tags.append("hostname_change")
-                        changed_fields["hostname"] = saved_ipv4_entries_dict_by_ip[ipv4]["hostname"]
-                        changes_message.append(
-                            f"OLD Hostname: {saved_ipv4_entries_dict_by_ip[ipv4]['hostname']}"
-                        )
-
-                    # Check if the interface has changed
-                    if (
-                        log_interface_changes
-                        and interface
-                        != saved_ipv4_entries_dict_by_ip[ipv4]["interface"]
-                    ):
-                        changes = True
-                        event_tags.append("interface_change")
-                        changed_fields["interface"] = saved_ipv4_entries_dict_by_ip[ipv4]["interface"]
-                        changes_message.append(
-                            f"OLD Interface: {saved_ipv4_entries_dict_by_ip[ipv4]['interface']}"
-                        )
-
-                    # Update the entry
-                    if changes:
-                        cursor.execute(
-                            "UPDATE arp_entries SET mac = ?, ipv6 = ?, interface = ?, hostname = ?, timestamp = ? WHERE ipv4 = ?",
-                            (mac, ipv6, interface, hostname, time_now, ipv4),
-                        )
-                        message = (
-                            "ARP - Changes detected! "
-                            + (
-                                f"IPv4: {ipv4} | "
-                                if protocols == "all" or protocols == "ipv4_only"
-                                else ""
-                            )
-                            + (
-                                f"IPv6: {ipv6} | "
-                                if protocols == "all" or protocols == "ipv6_only"
-                                else ""
-                            )
-                            + f"Hostname: {hostname} | MAC: {mac} | Vendor: {mac_vendor_check(mac)} | Interface: {interface}"
-                            + (
-                                " | " + " | ".join(changes_message)
-                                if len(changes_message) > 0
-                                else ""
-                            )
-                        )
-                        emit_event(
-                            ",".join(event_tags),
-                            mac,
-                            ipv4,
-                            ipv6,
-                            hostname,
-                            interface,
-                            time_now,
-                            message,
-                            changed_fields,
-                        )
-                    # Update the timestamp
-                    else:
-                        cursor.execute(
-                            "UPDATE arp_entries SET timestamp = ? WHERE ipv4 = ?",
-                            (time_now, ipv4),
-                        )
-
-                # Check if the IPv6 entry already exists
-                # This check allows to see, if an address is spoofed or multiple devices have the same IP
-                elif ipv6 != "unknown" and ipv6 in saved_ipv6_entries_dict_by_ip:
-
-                    changes = False
-                    changes_message = []
-                    event_tags = []
-                    changed_fields = {}
-
-                    # Check if the MAC address has changed
-                    if (
-                        log_mac_changes
-                        and mac != saved_ipv6_entries_dict_by_ip[ipv6]["mac"]
-                    ):
-                        changes = True
-                        event_tags.append("mac_change")
-                        old_mac = saved_ipv6_entries_dict_by_ip[ipv6]["mac"]
-                        changed_fields["mac"] = old_mac
-                        changed_fields["vendor"] = mac_vendor_check(old_mac)
-                        changes_message.append(
-                            f"OLD MAC: {old_mac} | OLD vendor: {changed_fields['vendor']}"
-                        )
-
-                    # Check if the hostname has changed
-                    if (
-                        log_hostname_changes
-                        and hostname != saved_ipv6_entries_dict_by_ip[ipv6]["hostname"]
-                    ):
-                        changes = True
-                        event_tags.append("hostname_change")
-                        changed_fields["hostname"] = saved_ipv6_entries_dict_by_ip[ipv6]["hostname"]
-                        changes_message.append(
-                            f"OLD Hostname: {saved_ipv6_entries_dict_by_ip[ipv6]['hostname']}"
-                        )
-
-                    # Check if the interface has changed
-                    if (
-                        log_interface_changes
-                        and interface
-                        != saved_ipv6_entries_dict_by_ip[ipv6]["interface"]
-                    ):
-                        changes = True
-                        event_tags.append("interface_change")
-                        changed_fields["interface"] = saved_ipv6_entries_dict_by_ip[ipv6]["interface"]
-                        changes_message.append(
-                            f"OLD Interface: {saved_ipv6_entries_dict_by_ip[ipv6]['interface']}"
-                        )
-
-                    # Update the entry
-                    if changes:
-                        cursor.execute(
-                            "UPDATE arp_entries SET mac = ?, ipv4 = ?, interface = ?, hostname = ?, timestamp = ? WHERE ipv6 = ?",
-                            (mac, ipv4, interface, hostname, time_now, ipv6),
-                        )
-                        message = (
-                            "ARP - Changes detected! "
-                            + (
-                                f"IPv4: {ipv4} | "
-                                if protocols == "all" or protocols == "ipv4_only"
-                                else ""
-                            )
-                            + (
-                                f"IPv6: {ipv6} | "
-                                if protocols == "all" or protocols == "ipv6_only"
-                                else ""
-                            )
-                            + f"Hostname: {hostname} | MAC: {mac} | Vendor: {mac_vendor_check(mac)} | Interface: {interface}"
-                            + (
-                                " | " + " | ".join(changes_message)
-                                if len(changes_message) > 0
-                                else ""
-                            )
-                        )
-                        emit_event(
-                            ",".join(event_tags),
-                            mac,
-                            ipv4,
-                            ipv6,
-                            hostname,
-                            interface,
-                            time_now,
-                            message,
-                            changed_fields,
-                        )
-                    # Update the timestamp
-                    else:
-                        cursor.execute(
-                            "UPDATE arp_entries SET timestamp = ? WHERE ipv6 = ?",
-                            (time_now, ipv6),
-                        )
-
-                elif log_new_entries:
-                    message = (
-                        "ARP - New entry detected! "
-                        + (
-                            f"IPv4: {ipv4} | "
-                            if protocols == "all" or protocols == "ipv4_only"
-                            else ""
-                        )
-                        + (
-                            f"IPv6: {ipv6} | "
-                            if protocols == "all" or protocols == "ipv6_only"
-                            else ""
-                        )
-                        + f"Hostname: {hostname} | MAC: {mac} | Vendor: {mac_vendor_check(mac)} | Interface: {interface}"
-                    )
-                    cursor.execute(
-                        "INSERT INTO arp_entries (mac, ipv4, ipv6, interface, hostname, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-                        (mac, ipv4, ipv6, interface, hostname, time_now),
+                    message = _entry_message(
+                        "ARP - New entry detected!", display_ipv4, display_ipv6, hostname, mac, vendor, interface
                     )
                     emit_event(
-                        "new_entry",
-                        mac,
-                        ipv4,
-                        ipv6,
-                        hostname,
-                        interface,
-                        time_now,
-                        message,
+                        "new_entry", mac, display_ipv4, display_ipv6, hostname, interface, time_now, message
                     )
+            continue
 
+        if mac in _pending_new_entries:
+            # Still settling in from its initial sighting - whatever changed
+            # here (new address, resolved hostname, ...) will already be
+            # reflected in the single delayed "new entry" mail once the
+            # grace period elapses, so don't also fire a separate change
+            # notification for it.
+            continue
+
+        # Known device, no conflict - check for anything worth logging
+        event_tags = []
+        changes_message = []
+        changed_fields = {}
+
+        if is_new_address:
+            proto_enabled = log_ipv4_changes if proto == "ipv4" else log_ipv6_changes
+            proto_in_scope = protocols == "all" or protocols == f"{proto}_only"
+            if proto_enabled and proto_in_scope:
+                on_cooldown = False
+                if proto == "ipv6" and ipv6_change_cooldown_hours > 0 and device_last_ipv6_alert:
+                    last_alert = datetime.strptime(device_last_ipv6_alert, "%Y-%m-%d %H:%M:%S")
+                    on_cooldown = (
+                        datetime.now() - last_alert
+                    ).total_seconds() < ipv6_change_cooldown_hours * 3600
+                if not on_cooldown:
+                    event_tags.append("ipv4_change" if proto == "ipv4" else "ipv6_change")
+                    if proto == "ipv6":
+                        cursor.execute(
+                            "UPDATE devices SET last_ipv6_alert = ? WHERE mac = ?", (time_now, mac)
+                        )
+
+        if log_hostname_changes and hostname != device_hostname:
+            event_tags.append("hostname_change")
+            changed_fields["hostname"] = device_hostname
+            changes_message.append(f"OLD Hostname: {device_hostname}")
+
+        if log_interface_changes and interface != device_interface:
+            event_tags.append("interface_change")
+            changed_fields["interface"] = device_interface
+            changes_message.append(f"OLD Interface: {device_interface}")
+
+        if event_tags:
+            message = _entry_message(
+                "ARP - Changes detected!", display_ipv4, display_ipv6, hostname, mac, vendor, interface, changes_message
+            )
+            emit_event(
+                ",".join(event_tags), mac, display_ipv4, display_ipv6, hostname, interface, time_now, message, changed_fields
+            )
+
+    conn.commit()
+
+
+def _next_pending_new_entry_wait():
+    # Seconds until the soonest delayed "new entry" mail is due, or None if
+    # there's nothing pending - used by main() to size its queue poll
+    # timeout so a flush isn't delayed by an otherwise-idle capture_queue.
+    if not _pending_new_entries:
+        return None
+    return max(0.0, min(_pending_new_entries.values()) - time.time())
+
+
+def _flush_pending_new_entries():
+    now = time.time()
+    due_macs = [mac for mac, deadline in _pending_new_entries.items() if deadline <= now]
+
+    for mac in due_macs:
+        del _pending_new_entries[mac]
+
+        cursor.execute("SELECT hostname, interface, last_seen FROM devices WHERE mac = ?", (mac,))
+        row = cursor.fetchone()
+        if row is None:
+            # Aged out (retention_days) during the grace period - nothing left to report
+            continue
+        hostname, interface, last_seen = row
+
+        vendor = mac_vendor_check(mac)
+        display_ipv4 = _format_ip_list(_device_ip_list(mac, "ipv4"))
+        display_ipv6 = _format_ip_list(_device_ip_list(mac, "ipv6"))
+        message = _entry_message(
+            "ARP - New entry detected!", display_ipv4, display_ipv6, hostname, mac, vendor, interface
+        )
+        emit_event("new_entry", mac, display_ipv4, display_ipv6, hostname, interface, last_seen, message)
+
+    if due_macs:
         conn.commit()
+
+
+def _build_bpf_filter():
+    # Same packet classes OPNsense's own hostwatch service captures: any ARP
+    # packet with a real (non-probe) sender address, and ICMPv6 Neighbor
+    # Solicitation (135) / Neighbor Advertisement (136). Reading the address
+    # straight out of these packets - instead of relying on arp -an/ndp -an -
+    # is what lets a device that never gets a kernel-resolved neighbor-cache
+    # entry (e.g. a DHCP-less device that only ever announces a link-local or
+    # APIPA address) still get detected.
+    parts = []
+    if protocols == "all" or protocols == "ipv4_only":
+        parts.append("(arp and not src host 0.0.0.0)")
+    if protocols == "all" or protocols == "ipv6_only":
+        parts.append("(icmp6 and (icmp6[icmp6type] == 135 or icmp6[icmp6type] == 136))")
+    return " or ".join(parts)
+
+
+def _enumerate_all_interfaces():
+    # Mirrors ArpNdpLoggingInterfaceField.php: every assigned, non-virtual
+    # interface. Used when the plugin's "Interfaces" setting is left empty
+    # ("all"), since - unlike arp -an/ndp -an - packet capture has no
+    # interface-less "everything" mode on FreeBSD and needs an explicit list
+    # of interfaces to attach to.
+    try:
+        # config.xml is OPNsense's own trusted, root-owned system config, not
+        # attacker-supplied input - see the same rationale on
+        # _load_hostname_sources() above.
+        root = ET.parse(CONFIG_XML_FILE).getroot()
+    except (ET.ParseError, OSError) as e:
+        logging.error(f"Failed to parse {CONFIG_XML_FILE} for interface list: {e}")
+        return []
+
+    ifaces_node = root.find("interfaces")
+    if ifaces_node is None:
+        return []
+
+    result = []
+    for node in ifaces_node:
+        if node.find("virtual") is not None:
+            continue
+        ifname = (node.findtext("if") or "").strip()
+        if ifname:
+            result.append(ifname)
+    return result
+
+
+def _format_mac(raw):
+    return ":".join(f"{b:02x}" for b in raw)
+
+
+def _parse_arp(frame):
+    # Ethernet(14) + ARP(28) for the standard Ethernet/IPv4 case
+    if len(frame) < 42:
+        return None
+    ptype = frame[16:18]
+    hlen = frame[18]
+    plen = frame[19]
+    if ptype != b"\x08\x00" or hlen != 6 or plen != 4:
+        return None
+    sender_mac = frame[22:28]
+    sender_ip = frame[28:32]
+    if sender_ip == b"\x00\x00\x00\x00":
+        # RFC 5227 probe stage, before the sender has picked an address -
+        # already excluded by the BPF filter, but the frame may still reach
+        # here if the OS delivered something slightly different than asked
+        return None
+    return _format_mac(sender_mac), "ipv4", ".".join(str(b) for b in sender_ip)
+
+
+def _parse_icmpv6_neighbor(frame):
+    # Ethernet(14) + IPv6(40) + ICMPv6 NS/NA header up to the target address
+    if len(frame) < 78:
+        return None
+    if frame[20] != 58:  # IPv6 next header != ICMPv6
+        return None
+    icmp_type = frame[54]
+    if icmp_type not in (135, 136):
+        return None
+
+    src_addr = frame[22:38]
+    if icmp_type == 135 and src_addr == b"\x00" * 16:
+        # Duplicate Address Detection: the host doesn't have a source
+        # address yet, so the address it's trying to claim only exists in
+        # the Neighbor Solicitation's target field
+        ip_bytes = frame[62:78]
+    else:
+        ip_bytes = src_addr
+
+    mac = _format_mac(frame[6:12])
+    return mac, "ipv6", socket.inet_ntop(socket.AF_INET6, ip_bytes)
+
+
+def _parse_frame(frame):
+    if len(frame) < 14:
+        return None
+    ethertype = frame[12:14]
+    if ethertype == b"\x08\x06":
+        return _parse_arp(frame)
+    if ethertype == b"\x86\xdd":
+        return _parse_icmpv6_neighbor(frame)
+    return None
+
+
+def _read_exact(stream, n):
+    data = b""
+    while len(data) < n:
+        chunk = stream.read(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+
+def _read_capture_stream(interface, stream, out_queue):
+    # tcpdump is run with -w - (classic pcap format) and -U (flush after
+    # every packet), read directly here instead of parsing tcpdump's
+    # human-readable text output, since the pcap file format and the raw
+    # Ethernet/ARP/IPv6/ICMPv6 wire formats are stable across tcpdump
+    # versions in a way its print formatting is not.
+    header = _read_exact(stream, 24)
+    if header is None:
+        return
+    (magic,) = struct.unpack("<I", header[:4])
+    if magic in (0xA1B2C3D4, 0xA1B23C4D):
+        endian = "<"
+    elif magic in (0xD4C3B2A1, 0x4D3CB2A1):
+        endian = ">"
+    else:
+        logging.error(f"Unexpected pcap header from tcpdump on {interface}: magic {magic:#x}")
+        return
+
+    while True:
+        record_header = _read_exact(stream, 16)
+        if record_header is None:
+            return
+        _, _, incl_len, _ = struct.unpack(endian + "IIII", record_header)
+        frame = _read_exact(stream, incl_len)
+        if frame is None:
+            return
+        parsed = _parse_frame(frame)
+        if parsed is not None:
+            mac, proto, ip = parsed
+            out_queue.put((mac, proto, ip, interface))
+
+
+def _capture_worker(interface, bpf_filter, out_queue):
+    backoff = 1
+    while not _stop_event.is_set():
+        started = time.time()
+        try:
+            proc = subprocess.Popen(
+                [TCPDUMP_BIN, "-i", interface, "-s", str(TCPDUMP_SNAPLEN), "-w", "-", "-U", "-n", bpf_filter],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as e:
+            logging.error(f"Failed to start tcpdump on {interface}: {e}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            continue
+
+        with _capture_procs_lock:
+            _capture_procs.append(proc)
+        try:
+            _read_capture_stream(interface, proc.stdout, out_queue)
+        finally:
+            proc.wait()
+            with _capture_procs_lock:
+                if proc in _capture_procs:
+                    _capture_procs.remove(proc)
+
+        if _stop_event.is_set():
+            break
+
+        logging.warning(f"tcpdump on {interface} exited (code {proc.returncode}), restarting capture")
+        backoff = 1 if time.time() - started > 30 else min(backoff * 2, 60)
+        time.sleep(backoff)
+
+
+def _handle_shutdown(_signum, _frame):
+    _stop_event.set()
+    with _capture_procs_lock:
+        procs = list(_capture_procs)
+    for p in procs:
+        try:
+            p.terminate()
+        except OSError:
+            pass
+
+
+def main():
+    capture_queue = queue.Queue()
+    bpf_filter = _build_bpf_filter()
+    capture_interfaces = interfaces if len(interfaces) > 0 else _enumerate_all_interfaces()
+
+    if len(capture_interfaces) == 0:
+        logging.error("No interfaces available to capture on; passive detection is disabled")
+    else:
+        logging.info(f"Starting passive capture on: {capture_interfaces}")
+        for capture_interface in capture_interfaces:
+            threading.Thread(
+                target=_capture_worker,
+                args=(capture_interface, bpf_filter, capture_queue),
+                daemon=True,
+            ).start()
+
+    # Seed state from the current arp/ndp tables once at startup
+    _process_entries(_startup_snapshot())
+
+    while not _stop_event.is_set():
+        batch = []
+        # Cap the poll timeout to the soonest due delayed "new entry" mail
+        # (if any), so a quiet capture_queue doesn't hold up its flush.
+        pending_wait = _next_pending_new_entry_wait()
+        poll_timeout = 60 if pending_wait is None else min(60, pending_wait)
+        try:
+            mac, proto, ip, iface = capture_queue.get(timeout=poll_timeout)
+            _append_observation(batch, mac, proto, ip, iface)
+            while True:
+                try:
+                    mac, proto, ip, iface = capture_queue.get_nowait()
+                except queue.Empty:
+                    break
+                _append_observation(batch, mac, proto, ip, iface)
+        except queue.Empty:
+            pass
+
+        _process_entries(batch)
+        _flush_pending_new_entries()
 
         # check if the log need to be rotated
         rotate_log()
-
-        # Wait before next check
-        time.sleep(60)
 
 
 LOG_MAX_BYTES = 5 * 1024 * 1024
@@ -1054,7 +1186,11 @@ def mac_vendor_check(mac):
             if mac.replace(":", "").lower().startswith(prefix[:length])
         ]
         if len(matches) == 1:
-            return matches[0]
+            # A matched prefix can still have a blank organization name in
+            # the source CSV (seen for e.g. the QEMU/libvirt virtual-NIC
+            # OUI) - treat that the same as no match rather than showing an
+            # empty value.
+            return matches[0] or "unknown"
 
     return "unknown"
 
@@ -1088,6 +1224,9 @@ if __name__ == "__main__":
         ok, err = send_webhook(_test_event())
         print("OK: test webhook sent" if ok else f"FAILED: {err}")
         raise SystemExit(0 if ok else 1)
+
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT, _handle_shutdown)
 
     # check if the log need to be rotated
     rotate_log()

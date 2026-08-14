@@ -80,7 +80,7 @@ class ServiceController extends ApiMutableServiceControllerBase
                 $db = new \SQLite3($dbFile, SQLITE3_OPEN_READONLY);
                 $db->enableExceptions(true);
 
-                $result = $db->query("SELECT COUNT(*) AS cnt FROM arp_entries");
+                $result = $db->query("SELECT COUNT(*) AS cnt FROM devices");
                 $row = $result->fetchArray(SQLITE3_ASSOC);
                 $total = intval($row['cnt']);
 

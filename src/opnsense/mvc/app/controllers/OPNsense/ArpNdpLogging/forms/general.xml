@@ -43,6 +43,21 @@
         <help>Enable or disable the logging of new entries</help>
     </field>
     <field>
+        <id>general.new_entry_delay_seconds</id>
+        <label>New entry delay (seconds)</label>
+        <type>text</type>
+        <advanced>true</advanced>
+        <help>
+            <![CDATA[Wait this many seconds after first seeing a brand-new device before sending its
+            "New entry" notification, so an address that resolves shortly after on the other
+            protocol (e.g. a device announcing over NDP and ARP a few seconds apart) is included in
+            that same mail instead of triggering an immediate separate "Changes detected"
+            notification. Address/hostname/interface changes seen for the device during this
+            window are folded into the delayed notification rather than notified separately.
+            0 = disabled, notify immediately. Default: 15.]]>
+        </help>
+    </field>
+    <field>
         <id>general.log_mac_changes</id>
         <label>Log MAC address changes</label>
         <type>checkbox</type>
@@ -59,6 +74,20 @@
         <label>Log IPv6 address changes</label>
         <type>checkbox</type>
         <help>Enable or disable the logging of IPv6 address changes</help>
+    </field>
+    <field>
+        <id>general.ipv6_change_cooldown_hours</id>
+        <label>IPv6 change cooldown (hours)</label>
+        <type>text</type>
+        <advanced>true</advanced>
+        <help>
+            <![CDATA[After an IPv6 address change is logged for a device, further IPv6 change
+            notifications for that same device are suppressed until this many hours have passed.
+            New addresses are still recorded and shown (alongside the device's other known
+            addresses) the next time a notification does fire - they just don't each trigger their
+            own notification. Useful to cut down on notifications caused by IPv6 privacy/temporary
+            address rotation. 0 = disabled, notify on every IPv6 address change (default).]]>
+        </help>
     </field>
     <field>
         <id>general.log_hostname_changes</id>
