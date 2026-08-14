@@ -1000,7 +1000,13 @@ def mac_vendor_list_download():
         not os.path.exists(MAC_VENDOR_FILE)
         or (time.time() - os.path.getmtime(MAC_VENDOR_FILE)) > 365 * 86400
     ):
-        url = "https://maclookup.app/downloads/csv-database/get-db"
+        # Self-hosted mirror (see .github/workflows/update-oui.yml and
+        # Scripts/build-oui-csv.py), refreshed weekly - avoids depending on
+        # a third-party site's uptime/format/bot-blocking at runtime.
+        url = (
+            "https://raw.githubusercontent.com/mr-manuel/"
+            "opnsense_arp-ndp-logging/refs/heads/mac-vendor-database/oui.csv"
+        )
         try:
             with urllib.request.urlopen(url, timeout=30) as response:
                 with open(MAC_VENDOR_FILE, "wb") as f:
@@ -1024,7 +1030,7 @@ def _get_mac_vendor_cache():
         return _mac_vendor_cache
 
     mac_vendor = {}
-    with open(MAC_VENDOR_FILE, "r") as f:
+    with open(MAC_VENDOR_FILE, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
         for row in reader:
             if len(row) >= 2:

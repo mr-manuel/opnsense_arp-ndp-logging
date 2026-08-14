@@ -1,0 +1,41 @@
+name: Update MAC vendor database
+
+# Independent of releases: keeps a self-hosted mirror of Wireshark's manuf
+# database fresh, so arpndplogging.py's vendor lookup doesn't depend on any
+# third-party site being reachable/unblocked at runtime on the firewall.
+# Published to the mac-vendor-database branch (not the release pkg repo on
+# GitHub Pages) so this has nothing to do with, and can't break, the actual
+# plugin releases.
+on:
+  schedule:
+    - cron: "0 4 * * 0" # weekly, Sunday 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-oui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Generate oui.csv
+        run: python3 Scripts/build-oui-csv.py --output "${RUNNER_TEMP}/oui.csv"
+
+      - name: Publish to mac-vendor-database branch
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout --orphan mac-vendor-database
+          git rm -rf --cached .
+          git clean -fdx
+
+          cp "${RUNNER_TEMP}/oui.csv" oui.csv
+          git add oui.csv
+          git commit -m "Update MAC vendor database"
+          git push --force origin HEAD:mac-vendor-database
