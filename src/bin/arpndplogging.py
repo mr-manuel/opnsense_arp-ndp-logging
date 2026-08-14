@@ -657,7 +657,7 @@ def _entry_message(prefix, ipv4, ipv6, hostname, mac, vendor, interface, changes
     return message
 
 
-def _process_entries(observations):
+def _process_entries(observations, notify=True):
     time_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # Age out addresses/devices/events not seen within retention_days. A
@@ -755,21 +755,20 @@ def _process_entries(observations):
         # An IP conflict takes priority over "new device"/"new address"
         # framing - matches the original code's precedence.
         if conflicting_mac is not None:
-            if not log_mac_changes:
-                continue
-            old_vendor = mac_vendor_check(conflicting_mac)
-            message = _entry_message(
-                "ARP - Changes detected!", display_ipv4, display_ipv6, hostname, mac, vendor, interface,
-                [f"OLD MAC: {conflicting_mac} | OLD vendor: {old_vendor}"],
-            )
-            emit_event(
-                "mac_change", mac, display_ipv4, display_ipv6, hostname, interface, time_now, message,
-                {"mac": conflicting_mac, "vendor": old_vendor},
-            )
+            if notify and log_mac_changes:
+                old_vendor = mac_vendor_check(conflicting_mac)
+                message = _entry_message(
+                    "ARP - Changes detected!", display_ipv4, display_ipv6, hostname, mac, vendor, interface,
+                    [f"OLD MAC: {conflicting_mac} | OLD vendor: {old_vendor}"],
+                )
+                emit_event(
+                    "mac_change", mac, display_ipv4, display_ipv6, hostname, interface, time_now, message,
+                    {"mac": conflicting_mac, "vendor": old_vendor},
+                )
             continue
 
         if is_new_device:
-            if log_new_entries:
+            if notify and log_new_entries:
                 if new_entry_delay_seconds > 0:
                     # Give the other protocol a chance to resolve (e.g. a
                     # device that announces over NDP and ARP a few seconds
@@ -826,7 +825,7 @@ def _process_entries(observations):
             changed_fields["interface"] = device_interface
             changes_message.append(f"OLD Interface: {device_interface}")
 
-        if event_tags:
+        if event_tags and notify:
             message = _entry_message(
                 "ARP - Changes detected!", display_ipv4, display_ipv6, hostname, mac, vendor, interface, changes_message
             )
@@ -1077,8 +1076,15 @@ def main():
                 daemon=True,
             ).start()
 
-    # Seed state from the current arp/ndp tables once at startup
-    _process_entries(_startup_snapshot())
+    # Seed state from the current arp/ndp tables once at startup. On a
+    # completely empty database (fresh install, or the state file was
+    # removed) this would otherwise report every device already on the
+    # network as a "new entry" all at once - suppress notifications for
+    # just this initial fill; devices are still recorded, so real changes
+    # are reported normally from then on.
+    cursor.execute("SELECT 1 FROM devices LIMIT 1")
+    initial_fill = cursor.fetchone() is None
+    _process_entries(_startup_snapshot(), notify=not initial_fill)
 
     while not _stop_event.is_set():
         batch = []
